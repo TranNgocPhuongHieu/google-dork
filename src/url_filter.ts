@@ -1,0 +1,1 @@
+export { isEligiblePostUrl } from './platforms';

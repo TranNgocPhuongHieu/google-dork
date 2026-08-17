@@ -1,0 +1,77 @@
+name: social-google-dork
+
+services:
+  google-dork:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: "${GOOGLE_DORK_IMAGE:-social-google-dork-playwright:latest}"
+    container_name: google_dork
+    init: true
+    restart: always
+    shm_size: 1gb
+    stop_grace_period: 30s
+    environment:
+      TZ: "Asia/Ho_Chi_Minh"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_FORMAT: "${LOG_FORMAT:-text}"
+      KAFKAJS_NO_PARTITIONER_WARNING: "1"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-admin}@db_social:5432/${POSTGRES_DB:-social_scraper}
+      KAFKA_ENABLED: "true"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_DONE_TOPIC: "${KAFKA_DONE_TOPIC:-social.done}"
+      KAFKA_CONSUMER_GROUP_ID: "${KAFKA_CONSUMER_GROUP_ID:-google-dork-playwright-v1}"
+      SEARCH_WORKERS: "1"
+      SEARCH_SPLIT_DAYS: "${SEARCH_SPLIT_DAYS:-1}"
+      SEARCH_MAX_PAGES: "${SEARCH_MAX_PAGES:-9}"
+      SEARCH_TIER_A_MAX_PAGES: "${SEARCH_TIER_A_MAX_PAGES:-9}"
+      SEARCH_TIER_B_MAX_PAGES: "${SEARCH_TIER_B_MAX_PAGES:-6}"
+      SEARCH_TIER_C_MAX_PAGES: "${SEARCH_TIER_C_MAX_PAGES:-3}"
+      SEARCH_MAX_ATTEMPTS: "${SEARCH_MAX_ATTEMPTS:-3}"
+      # Rotating tier = 1 entry, đã bị Google khoá. Mỗi round ngủ 30s rồi phát hiện
+      # tier đang blocked và bỏ ngay -> 88/164 phút wall-clock của job, 0 query cứu được.
+      SEARCH_RECOVERY_ROTATING_ROUNDS: "${SEARCH_RECOVERY_ROTATING_ROUNDS:-0}"
+      # Nhịp cào được điều tiết bởi SEARCH_POOL_WAIT_MAX_MS (crawler chờ proxy hồi
+      # khi pool cạn), KHÔNG phải bởi delay này. Đo 2026-08-06 sau khi bật pool_wait:
+      # 0.52 q/min = 0.63x nhịp cân bằng, no_proxy=0. Nâng delay lên nữa chỉ kéo dài
+      # job (+82 phút/141 query) mà không giảm CAPTCHA.
+      SEARCH_QUERY_DELAY_MIN_MS: "${SEARCH_QUERY_DELAY_MIN_MS:-30000}"
+      SEARCH_QUERY_DELAY_MAX_MS: "${SEARCH_QUERY_DELAY_MAX_MS:-60000}"
+      # Khi pool cạn: chờ proxy sớm nhất hồi (tối đa ngần này) thay vì bỏ query.
+      SEARCH_POOL_WAIT_MAX_MS: "${SEARCH_POOL_WAIT_MAX_MS:-1200000}"
+      SEARCH_PAGE_DELAY_MIN_MS: "${SEARCH_PAGE_DELAY_MIN_MS:-10000}"
+      SEARCH_PAGE_DELAY_MAX_MS: "${SEARCH_PAGE_DELAY_MAX_MS:-20000}"
+      JOB_HEARTBEAT_SECONDS: "${JOB_HEARTBEAT_SECONDS:-60}"
+      BROWSER_HEADLESS: "${BROWSER_HEADLESS:-true}"
+      BROWSER_NAVIGATION_TIMEOUT_MS: "${BROWSER_NAVIGATION_TIMEOUT_MS:-45000}"
+      BROWSER_RESULT_WAIT_TIMEOUT_MS: "${BROWSER_RESULT_WAIT_TIMEOUT_MS:-15000}"
+      BROWSER_LOCALE: "${BROWSER_LOCALE:-vi-VN}"
+      PROXY_FAILURE_COOLDOWN_MS: "${PROXY_FAILURE_COOLDOWN_MS:-300000}"
+      PROXY_BLOCKED_COOLDOWN_MS: "${PROXY_BLOCKED_COOLDOWN_MS:-1200000}"
+      # Ép proxy nghỉ sau khi query thành công (0 = tắt, giữ hành vi cũ).
+      # Bật để cắt vòng "thắng rồi ăn CAPTCHA ngay lượt sau"; cần đo trước khi chốt giá trị.
+      PROXY_SUCCESS_COOLDOWN_MS: "${PROXY_SUCCESS_COOLDOWN_MS:-0}"
+      PROXY_ROTATING_RESET_TIMEOUT_MS: "${PROXY_ROTATING_RESET_TIMEOUT_MS:-15000}"
+      PROXY_ROTATING_RESET_WAIT_MS: "${PROXY_ROTATING_RESET_WAIT_MS:-5000}"
+      PROXY_DB_HOST: db_proxy
+      PROXY_DB_PORT: "5432"
+      PROXY_DB_NAME: proxy
+      PROXY_DB_USER: admin
+      PROXY_DB_PASSWORD: admin
+      CAPTCHA_API_KEY: "${CAPTCHA_API_KEY:-}"
+      CAPTCHA_TIMEOUT_MS: "${CAPTCHA_TIMEOUT_MS:-120000}"
+      CAPTCHA_POLL_MS: "${CAPTCHA_POLL_MS:-5000}"
+      CAPTCHA_LOCAL_AUDIO_ENABLED: "${CAPTCHA_LOCAL_AUDIO_ENABLED:-false}"
+      CAPTCHA_LOCAL_TIMEOUT_MS: "${CAPTCHA_LOCAL_TIMEOUT_MS:-60000}"
+      CAPTCHA_LOCAL_MAX_ATTEMPTS: "${CAPTCHA_LOCAL_MAX_ATTEMPTS:-2}"
+      CAPTCHA_LOCAL_LANGUAGE: "${CAPTCHA_LOCAL_LANGUAGE:-en-US}"
+      CAPTCHA_VOSK_MODEL_PATH: "${CAPTCHA_VOSK_MODEL_PATH:-/opt/models/vosk}"
+      CAPTCHA_VOSK_LIBRARY_PATH: "${CAPTCHA_VOSK_LIBRARY_PATH:-/opt/vosk/lib/libvosk.so}"
+      CAPTCHA_FFMPEG_PATH: "${CAPTCHA_FFMPEG_PATH:-/usr/bin/ffmpeg}"
+      CAPTCHA_WORKER_SHUTDOWN_MS: "${CAPTCHA_WORKER_SHUTDOWN_MS:-3000}"
+    networks:
+      - social-orchestration_default
+
+networks:
+  social-orchestration_default:
+    external: true

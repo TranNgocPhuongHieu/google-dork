@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.log
+debug_*.png
+.DS_Store
+secrets/*
+!secrets/.gitkeep
+
+# Local operational evidence and handoff notes may contain runtime details.
+evidence/
+HANDOFF-*.md

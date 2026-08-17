@@ -1,0 +1,10 @@
+node_modules
+dist
+openserp
+*.log
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+README.md

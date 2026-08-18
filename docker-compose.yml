@@ -28,15 +28,12 @@ services:
       SEARCH_TIER_B_MAX_PAGES: "${SEARCH_TIER_B_MAX_PAGES:-6}"
       SEARCH_TIER_C_MAX_PAGES: "${SEARCH_TIER_C_MAX_PAGES:-3}"
       SEARCH_MAX_ATTEMPTS: "${SEARCH_MAX_ATTEMPTS:-3}"
-      # Rotating tier = 1 entry, đã bị Google khoá. Mỗi round ngủ 30s rồi phát hiện
-      # tier đang blocked và bỏ ngay -> 88/164 phút wall-clock của job, 0 query cứu được.
-      SEARCH_RECOVERY_ROTATING_ROUNDS: "${SEARCH_RECOVERY_ROTATING_ROUNDS:-0}"
-      # Nhịp cào được điều tiết bởi SEARCH_POOL_WAIT_MAX_MS (crawler chờ proxy hồi
-      # khi pool cạn), KHÔNG phải bởi delay này. Đo 2026-08-06 sau khi bật pool_wait:
-      # 0.52 q/min = 0.63x nhịp cân bằng, no_proxy=0. Nâng delay lên nữa chỉ kéo dài
-      # job (+82 phút/141 query) mà không giảm CAPTCHA.
-      SEARCH_QUERY_DELAY_MIN_MS: "${SEARCH_QUERY_DELAY_MIN_MS:-30000}"
-      SEARCH_QUERY_DELAY_MAX_MS: "${SEARCH_QUERY_DELAY_MAX_MS:-60000}"
+      # Rotating proxy có reset_url; dùng hai recovery round để thử IP mới sau CAPTCHA.
+      SEARCH_RECOVERY_ROTATING_ROUNDS: "${SEARCH_RECOVERY_ROTATING_ROUNDS:-2}"
+      # Giãn nhịp giữa query để giảm burst lên Google; pool wait vẫn là cơ chế
+      # backpressure khi toàn bộ proxy primary đang cooldown.
+      SEARCH_QUERY_DELAY_MIN_MS: "${SEARCH_QUERY_DELAY_MIN_MS:-90000}"
+      SEARCH_QUERY_DELAY_MAX_MS: "${SEARCH_QUERY_DELAY_MAX_MS:-180000}"
       # Khi pool cạn: chờ proxy sớm nhất hồi (tối đa ngần này) thay vì bỏ query.
       SEARCH_POOL_WAIT_MAX_MS: "${SEARCH_POOL_WAIT_MAX_MS:-1200000}"
       SEARCH_PAGE_DELAY_MIN_MS: "${SEARCH_PAGE_DELAY_MIN_MS:-10000}"
@@ -48,9 +45,9 @@ services:
       BROWSER_LOCALE: "${BROWSER_LOCALE:-vi-VN}"
       PROXY_FAILURE_COOLDOWN_MS: "${PROXY_FAILURE_COOLDOWN_MS:-300000}"
       PROXY_BLOCKED_COOLDOWN_MS: "${PROXY_BLOCKED_COOLDOWN_MS:-1200000}"
-      # Ép proxy nghỉ sau khi query thành công (0 = tắt, giữ hành vi cũ).
-      # Bật để cắt vòng "thắng rồi ăn CAPTCHA ngay lượt sau"; cần đo trước khi chốt giá trị.
-      PROXY_SUCCESS_COOLDOWN_MS: "${PROXY_SUCCESS_COOLDOWN_MS:-0}"
+      # Ép proxy nghỉ sau khi query thành công để tránh tái sử dụng ngay trước
+      # khi Google phát CAPTCHA liên tiếp.
+      PROXY_SUCCESS_COOLDOWN_MS: "${PROXY_SUCCESS_COOLDOWN_MS:-600000}"
       PROXY_ROTATING_RESET_TIMEOUT_MS: "${PROXY_ROTATING_RESET_TIMEOUT_MS:-15000}"
       PROXY_ROTATING_RESET_WAIT_MS: "${PROXY_ROTATING_RESET_WAIT_MS:-5000}"
       PROXY_DB_HOST: db_proxy

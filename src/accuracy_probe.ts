@@ -1,5 +1,6 @@
 import { REGISTRY } from './entity_registry';
 import { buildSiteSearchTexts, normalizeSite } from './platforms';
+import { DEFAULT_PROFILE, isSearchProfile, SearchProfile } from './profiles';
 import { buildQueries, GoogleTimeFilter } from './query_builder';
 
 const ALLOWED_SITES = new Set(['facebook.com', 'instagram.com', 'tiktok.com']);
@@ -70,6 +71,7 @@ export interface ProbeCaptchaEvent {
 export interface AccuracyProbeConfig {
   confirmLive: boolean;
   localCaptchaEnabled: boolean;
+  profile: SearchProfile;
   sites: string[];
   slugs: string[];
   dateFrom: string;
@@ -207,6 +209,15 @@ function assertDate(value: string, key: string): void {
   }
 }
 
+function parseProbeProfile(raw: string | undefined): SearchProfile {
+  const value = raw?.trim().toLowerCase();
+  if (!value) return DEFAULT_PROFILE;
+  if (!isSearchProfile(value)) {
+    throw new Error('PROBE_PROFILE must contain a known search profile');
+  }
+  return value;
+}
+
 export function loadAccuracyProbeConfig(
   env: NodeJS.ProcessEnv = process.env,
   now: Date = new Date(),
@@ -238,6 +249,7 @@ export function loadAccuracyProbeConfig(
       'CAPTCHA_LOCAL_AUDIO_ENABLED',
       false,
     ),
+    profile: parseProbeProfile(env.PROBE_PROFILE),
     sites,
     slugs,
     dateFrom,
@@ -291,26 +303,28 @@ export function buildAccuracyProbeQueries(config: AccuracyProbeConfig): Accuracy
   const queries: AccuracyProbeQuery[] = [];
   for (const slug of config.slugs) {
     for (const site of config.sites) {
-      const [searchText] = buildSiteSearchTexts(site, slug);
-      if (!searchText) continue;
-      const built = buildQueries(
-        [site],
-        searchText,
-        config.dateFrom,
-        config.dateTo,
-        1,
-        'custom',
-        'bounded',
-      );
-      for (const query of built) {
-        queries.push({
-          id: `probe-${queries.length + 1}`,
-          query: query.query,
-          site: query.site,
-          maxPages: 1,
-          timeFilter: 'custom',
-        });
-        if (queries.length >= config.maxQueries) return queries;
+      const searchTexts = buildSiteSearchTexts(site, slug, config.profile);
+      for (const searchText of searchTexts) {
+        if (!searchText) continue;
+        const built = buildQueries(
+          [site],
+          searchText,
+          config.dateFrom,
+          config.dateTo,
+          1,
+          'custom',
+          'bounded',
+        );
+        for (const query of built) {
+          queries.push({
+            id: `probe-${queries.length + 1}`,
+            query: query.query,
+            site: query.site,
+            maxPages: 1,
+            timeFilter: 'custom',
+          });
+          if (queries.length >= config.maxQueries) return queries;
+        }
       }
     }
   }

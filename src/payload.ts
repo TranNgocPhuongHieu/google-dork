@@ -1,5 +1,6 @@
 import { GoogleTimeFilter } from './query_builder';
 import { normalizeSite } from './platforms';
+import { DEFAULT_PROFILE, isSearchProfile, SearchProfile } from './profiles';
 
 export type DorkJobType = 'daily' | 'backfill' | 'manual' | 'reconciliation';
 
@@ -9,6 +10,7 @@ export interface DorkTriggerPayload {
   search_sites: string[];
   date_from: string;
   date_to: string;
+  search_profile: SearchProfile;
   time_filter?: GoogleTimeFilter;
   keyword_ids?: number[];
   split_days?: number;
@@ -68,6 +70,20 @@ function parseTimeFilter(value: unknown): GoogleTimeFilter {
     throw new Error(`time_filter must be one of ${Array.from(TIME_FILTERS).join(', ')}`);
   }
   return timeFilter;
+}
+
+function parseSearchProfile(value: unknown): SearchProfile {
+  if (value === undefined || value === null) return DEFAULT_PROFILE;
+  if (typeof value !== 'string') {
+    throw new Error('search_profile must be a string');
+  }
+
+  const profile = value.trim().toLowerCase();
+  if (!profile) return DEFAULT_PROFILE;
+  if (!isSearchProfile(profile)) {
+    throw new Error('search_profile must be a registered profile');
+  }
+  return profile;
 }
 
 function parseKeywordIds(value: unknown): number[] {
@@ -131,6 +147,7 @@ export function parseDorkTriggerPayload(raw: unknown): DorkTriggerPayload {
     search_sites: parseSites(raw.search_sites),
     date_from: parseDate(raw.date_from, 'date_from'),
     date_to: parseDate(raw.date_to, 'date_to'),
+    search_profile: parseSearchProfile(raw.search_profile),
   };
 
   if (payload.date_to < payload.date_from) {

@@ -1,4 +1,7 @@
 import { getProvince } from './entity_registry';
+import { chunkPlaces } from './place_scheduler';
+import { getProfile, SearchProfile } from './profiles';
+import { PlaceEntry } from './profiles/types';
 
 export const SITE_ALIASES: Record<string, string> = {
   facebook: 'facebook.com',
@@ -30,6 +33,12 @@ const SITE_URL_NEGATIVES: Record<string, string[]> = {
   'instagram.com': ['-inurl:explore', '-inurl:stories', '-inurl:accounts'],
   'tiktok.com': ['-inurl:tag', '-inurl:discover', '-inurl:search', '-site:shop.tiktok.com'],
 };
+/** Hard cap for the complete Google query, including operators/date reserve. */
+export const QUERY_WORD_BUDGET = 32;
+/** Place profiles keep each intent group intact after budget fallback. */
+export const MAX_CHUNKS_PER_GROUP = 1;
+const SITE_OPERATOR_WORDS = 1;
+const DATE_RESERVE_WORDS = 2;
 const PLACE_LIMIT_BY_TIER = { A: 4, B: 3, C: 2 } as const;
 const NOISY_ALIAS_DENYLIST = new Set(['Bà Nà Hills', 'Vinpearl Nha Trang', 'thác Datanla', 'Landmark 81']);
 const MATH_BOLD = /[\u{1D400}-\u{1D7FF}]/u;
@@ -56,6 +65,28 @@ function buildOrGroup(terms: string[]): string {
   return `(${terms.map(quoteTerm).join(' OR ')})`;
 }
 
+/**
+ * Count Google's whitespace-delimited query words using the project's budget
+ * convention. Parentheses and quotes are syntax, while OR remains a word.
+ */
+export function countQueryWords(query: string): number {
+  const stripped = query.replace(/[()\"]/g, '').trim();
+  return stripped ? stripped.split(/\s+/).length : 0;
+}
+
+function queryOverheadWords(site: string): number {
+  const normalizedSite = normalizeSite(site);
+  return (
+    SITE_OPERATOR_WORDS +
+    (SITE_URL_NEGATIVES[normalizedSite]?.length ?? 0) +
+    DATE_RESERVE_WORDS
+  );
+}
+
+function fitsQueryBudget(site: string, body: string): boolean {
+  return countQueryWords(body) + queryOverheadWords(site) <= QUERY_WORD_BUDGET;
+}
+
 function buildNegativeTerms(terms: string[]): string {
   return terms
     .map((term) => {
@@ -77,11 +108,127 @@ function getSearchAliases(slug: string): string[] {
     .map((term) => term.normalize('NFC'));
 }
 
+function buildIntentGroup(terms: string[]): string {
+  return buildOrGroup(uniqueTerms(terms));
+}
+
+function commercialNegativesForSite(
+  profile: ReturnType<typeof getProfile>,
+  site: string,
+): string[] {
+  const normalizedSite = normalizeSite(site);
+  return profile.commercialNegativesBySite?.[normalizedSite] ?? profile.commercialNegatives;
+}
+
+function buildBodiesForPlaceGroup(
+  site: string,
+  spec: ReturnType<typeof getProfile>,
+  places: PlaceEntry[],
+  commercialNegatives: string[],
+): string[] | null {
+  const names = uniqueTerms(places.map((place) => place.name.normalize('NFC')));
+  if (names.length === 0) return null;
+  const placesGroup = buildOrGroup(names);
+  const negatives = buildNegativeTerms(commercialNegatives);
+  const suffix = negatives ? ` ${negatives}` : '';
+
+  if (spec.intentGroups && spec.intentGroups.length > 0) {
+    const bodies = spec.intentGroups.map((terms) => {
+      const normalizedTerms = uniqueTerms(terms);
+      return `${placesGroup} ${buildIntentGroup(normalizedTerms)}${suffix}`.trim().normalize('NFC');
+    });
+    return bodies.length > 0 && bodies.every((body) => fitsQueryBudget(site, body)) ? bodies : null;
+  }
+
+  if (!spec.intentLiteral) return null;
+  const body = `${placesGroup} ${quoteTerm(spec.intentLiteral)}${suffix}`.trim().normalize('NFC');
+  return fitsQueryBudget(site, body) ? [body] : null;
+}
+
+function splitPlaceGroup(places: PlaceEntry[], maxPlaces: number): PlaceEntry[][] {
+  const groups: PlaceEntry[][] = [];
+  for (let i = 0; i < places.length; i += maxPlaces) {
+    groups.push(places.slice(i, i + maxPlaces));
+  }
+  return groups;
+}
+
 /**
- * Build one accuracy-first query body per province/site. The site operator,
- * URL exclusions and date operators are added by the query builder.
+ * Find the largest place grouping that keeps every literal/intent group within
+ * the complete-query word budget. Fallback is deliberately place-only so
+ * intent terms and commercial negatives are never discarded.
  */
-export function buildSiteSearchTexts(site: string, slug: string): string[] {
+export function fitPlaceGroupsToBudget(
+  site: string,
+  profile: SearchProfile,
+  places: PlaceEntry[],
+): PlaceEntry[][] | null {
+  const spec = getProfile(profile);
+  const normalizedSite = normalizeSite(site);
+  if (!spec.sites.some((candidate) => normalizeSite(candidate) === normalizedSite)) return [];
+  if (places.length === 0) return [];
+
+  const commercialNegatives = commercialNegativesForSite(spec, normalizedSite);
+  const minimumGroupSize = Math.min(2, places.length);
+  for (let maxPlaces = places.length; maxPlaces >= minimumGroupSize; maxPlaces--) {
+    const groups = splitPlaceGroup(places, maxPlaces);
+    if (groups.every((group) => buildBodiesForPlaceGroup(normalizedSite, spec, group, commercialNegatives))) {
+      return groups;
+    }
+  }
+
+  return null;
+}
+
+function buildPlaceSearchTexts(
+  site: string,
+  profile: SearchProfile,
+  places: PlaceEntry[],
+): string[] {
+  const spec = getProfile(profile);
+  const normalizedSite = normalizeSite(site);
+  if (!spec.sites.some((candidate) => normalizeSite(candidate) === normalizedSite)) return [];
+  const commercialNegatives = commercialNegativesForSite(spec, site);
+  const placeGroups = fitPlaceGroupsToBudget(normalizedSite, profile, places);
+  if (!placeGroups) {
+    const kind = spec.intentLiteral ? 'intent literal' : 'intent groups';
+    const names = places.map((place) => place.name).join('|');
+    console.warn(
+      `[platforms] dropping over-budget ${kind} profile=${profile} site=${normalizedSite} places=${names}`,
+    );
+    return [];
+  }
+
+  return placeGroups.flatMap((group) =>
+    buildBodiesForPlaceGroup(normalizedSite, spec, group, commercialNegatives) ?? [],
+  );
+}
+
+/**
+ * Build search bodies for either the unchanged legacy registry path or a
+ * profile's selected place chunk. `places` is optional so existing callers
+ * retain the exact two/three-argument contract.
+ */
+export function buildProfileSearchTexts(
+  site: string,
+  slug: string,
+  profile: SearchProfile,
+  places?: PlaceEntry[],
+): string[] {
+  const spec = getProfile(profile);
+  if (spec.useLegacyRegistry) {
+    return buildLegacySiteSearchTexts(site, slug);
+  }
+  if (places) return buildPlaceSearchTexts(site, profile, places);
+
+  // Accuracy-probe and other profile callers may not have scheduler output.
+  // Use configured chunks first; a group is subdivided only if it cannot fit.
+  const provincePlaces = spec.places.filter((place) => place.provinceSlug === slug);
+  const chunks = chunkPlaces(provincePlaces, spec.placesPerQuery);
+  return chunks.flatMap((chunk) => buildPlaceSearchTexts(site, profile, chunk.places));
+}
+
+function buildLegacySiteSearchTexts(site: string, slug: string): string[] {
   const s = normalizeSite(site);
   if (!['facebook.com', 'instagram.com', 'tiktok.com'].includes(s)) return [];
   const aliases = getSearchAliases(slug);
@@ -89,6 +236,19 @@ export function buildSiteSearchTexts(site: string, slug: string): string[] {
   return [
     `${buildOrGroup(aliases)} "du lịch" ${buildNegativeTerms(COMMERCIAL_NEGATIVES)}`.normalize('NFC'),
   ];
+}
+
+/**
+ * Build one accuracy-first query body per province/site. The site operator,
+ * URL exclusions and date operators are added by the query builder.
+ */
+export function buildSiteSearchTexts(
+  site: string,
+  slug: string,
+  profile: SearchProfile = 'vi_legacy',
+  places?: PlaceEntry[],
+): string[] {
+  return buildProfileSearchTexts(site, slug, profile, places);
 }
 
 export function extractPostId(url: string, domain: string): string | null {

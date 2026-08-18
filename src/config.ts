@@ -1,5 +1,6 @@
 import { GoogleTimeFilter } from './query_builder';
 import { DorkJobType } from './payload';
+import { DEFAULT_PROFILE, isSearchProfile, SearchProfile } from './profiles';
 import { isAbsolute } from 'node:path';
 
 export type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
@@ -65,6 +66,7 @@ export interface RuntimeConfig {
     workerShutdownMs: number;
   };
   oneShot: {
+    searchProfile: SearchProfile;
     sites: string[];
     dateFrom: string;
     dateTo: string;
@@ -154,6 +156,15 @@ function parseOptionalEnum<T extends string>(
     throw new Error(`${key} must be one of ${Array.from(allowed).join(', ')}`);
   }
   return normalized;
+}
+
+function parseSearchProfile(raw: string | undefined): SearchProfile {
+  const value = trim(raw).toLowerCase();
+  if (!value) return DEFAULT_PROFILE;
+  if (!isSearchProfile(value)) {
+    throw new Error(`SEARCH_PROFILE must be a known search profile`);
+  }
+  return value;
 }
 
 function parseCsvList(raw: string | undefined): string[] {
@@ -387,6 +398,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
       ),
     },
     oneShot: {
+      searchProfile: parseSearchProfile(env.SEARCH_PROFILE),
       sites: parseCsvList(env.SEARCH_SITES),
       dateFrom: trim(env.SEARCH_DATE_FROM),
       dateTo: trim(env.SEARCH_DATE_TO),
@@ -441,6 +453,7 @@ export function describeConfig(cfg: RuntimeConfig = config): Record<string, unkn
       worker_shutdown_ms: cfg.captcha.workerShutdownMs,
     },
     one_shot: {
+      search_profile: cfg.oneShot.searchProfile,
       sites: cfg.oneShot.sites,
       date_from: cfg.oneShot.dateFrom || '[unset]',
       date_to: cfg.oneShot.dateTo || '[unset]',

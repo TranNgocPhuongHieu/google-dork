@@ -7,6 +7,10 @@ import { validateDiscoveredUrl } from './src/validator';
 import { config, describeConfig } from './src/config';
 import { normalizeSite, buildSiteSearchTexts, isLikelyAdResult } from './src/platforms';
 import { getProvince } from './src/entity_registry';
+import { getProfile, SearchProfile } from './src/profiles';
+import { chunkPlaces, selectDuePlaces, windowFor } from './src/place_scheduler';
+import { resolveMaxPages } from './src/page_depth';
+import { CadenceGroup, PlaceEntry } from './src/profiles/types';
 import {
   loadPlatformCache,
   resolvePlatformId,
@@ -37,6 +41,18 @@ interface KeywordEntry {
 interface JobRunSummary {
   totalUrlsScraped: number;
   urlsScrapedBySite: Record<string, number>;
+}
+
+interface SearchWindow {
+  dateFrom: string;
+  dateTo: string;
+  cadence?: CadenceGroup;
+  places?: PlaceEntry[];
+}
+
+interface PlannedQuery {
+  query: BuiltQuery;
+  maxPages: number;
 }
 
 class JobFailedError extends Error {
@@ -89,6 +105,7 @@ async function loadKeywords(keywordIds?: number[]): Promise<KeywordEntry[]> {
 async function runOneKeyword(
   entry: KeywordEntry,
   sites: string[],
+  profile: SearchProfile,
   dateFrom: string,
   dateTo: string,
   splitDays: number,
@@ -97,12 +114,15 @@ async function runOneKeyword(
   requestedMaxPages: number,
   runIdBySite?: Map<string, string>,
   insertedBySite?: Map<string, number>,
+  today: Date = new Date(),
 ) {
   const { keyword_id, province } = entry;
   const keywordId = keyword_id;
   logger.debug(`[${province}] keyword_id=${keywordId}`);
 
-  const queriesData: BuiltQuery[] = [];
+  const profileSpec = getProfile(profile);
+
+  const queriesData: PlannedQuery[] = [];
   const effectiveTimeFilter = (timeFilter ?? 'custom') as GoogleTimeFilter;
   const isRelativeFilter = effectiveTimeFilter !== 'custom';
   const dateMode: DateQueryMode = jobType === 'daily' ? 'rolling' : 'bounded';
@@ -114,34 +134,62 @@ async function runOneKeyword(
         ? 0
         : splitDays;
   const provinceEntry = getProvince(province);
-  const tierMaxPages = provinceEntry
-    ? {
-        A: config.search.tierAMaxPages,
-        B: config.search.tierBMaxPages,
-        C: config.search.tierCMaxPages,
-      }[provinceEntry.tier]
-    : config.search.tierCMaxPages;
-  const maxPages = Math.max(1, Math.min(requestedMaxPages, tierMaxPages));
+  const tier = provinceEntry?.tier ?? 'C';
+  const legacyTierMaxPages = {
+    A: config.search.tierAMaxPages,
+    B: config.search.tierBMaxPages,
+    C: config.search.tierCMaxPages,
+  };
+
+  const searchWindows: SearchWindow[] = [];
+  if (profileSpec.useLegacyRegistry) {
+    // Keep the legacy registry path on the original payload date window.
+    searchWindows.push({ dateFrom, dateTo });
+  } else {
+    if (profileSpec.placesPerQuery < 1) {
+      throw new Error(`Profile ${profile} placesPerQuery must be at least 1`);
+    }
+
+    const provincePlaces = profileSpec.places.filter((place) => place.provinceSlug === province);
+    const chunks = chunkPlaces(provincePlaces, profileSpec.placesPerQuery);
+    const dueChunks = selectDuePlaces(chunks, profileSpec.cadence, today);
+
+    for (const chunk of dueChunks) {
+      const window = windowFor(chunk, profileSpec.cadence, today);
+      searchWindows.push({ ...window, cadence: chunk.cadence, places: chunk.places });
+    }
+
+    if (searchWindows.length === 0) {
+      logger.debug(`[${province}] profile=${profile} has no due places`);
+    }
+  }
 
   // Expand the province into one accuracy-first dork per site/date window.
-  for (const site of sites) {
-    const searchTexts = buildSiteSearchTexts(site, province);
-    for (const st of searchTexts) {
-      const siteQueries = buildQueries(
-        [site],
-        st,
-        dateFrom,
-        dateTo,
-        effectiveSplitDays,
-        effectiveTimeFilter,
-        dateMode,
-      );
-      queriesData.push(...siteQueries);
+  for (const searchWindow of searchWindows) {
+    const maxPages = resolveMaxPages(profileSpec, tier, searchWindow.cadence, {
+      requestedMaxPages,
+      searchMaxPages: config.search.maxPages,
+      legacyTierMaxPages,
+    });
+    for (const site of sites) {
+      const searchTexts = buildSiteSearchTexts(site, province, profile, searchWindow.places);
+      for (const st of searchTexts) {
+        const siteQueries = buildQueries(
+          [site],
+          st,
+          searchWindow.dateFrom,
+          searchWindow.dateTo,
+          effectiveSplitDays,
+          effectiveTimeFilter,
+          dateMode,
+        );
+        queriesData.push(...siteQueries.map((query) => ({ query, maxPages })));
+      }
     }
   }
 
   const queryToSite = new Map<string, string>();
-  for (const qd of queriesData) queryToSite.set(qd.query, qd.site);
+  for (const { query } of queriesData) queryToSite.set(query.query, query.site);
 
   // Keep URL validation, post-id extraction and DB insertion unchanged.
   const onResults = async (results: SearchResult[], query: string): Promise<number> => {
@@ -208,13 +256,26 @@ async function runOneKeyword(
     }
   };
 
-  const specs: GoogleQuerySpec[] = queriesData.map((q) => ({
-    id: q.query,
-    query: q.query,
-    site: q.site,
+  const specs: GoogleQuerySpec[] = queriesData.map(({ query, maxPages }) => ({
+    id: query.query,
+    query: query.query,
+    site: query.site,
     maxPages,
     timeFilter: effectiveTimeFilter,
   }));
+
+  if (specs.length === 0) {
+    return {
+      totalQueries: 0,
+      totalFound: 0,
+      totalInserted: 0,
+      totalDuplicates: 0,
+      failedQueries: [],
+      blockedQueries: [],
+      failedSites: [],
+      blockedSites: [],
+    };
+  }
 
   const stats = await runGoogleCrawler({ queries: specs, onResults, onProgress, logPrefix: province });
   const failedSites = Array.from(
@@ -240,17 +301,34 @@ async function runJob(payload: DorkTriggerPayload): Promise<JobRunSummary> {
     date_from: dateFrom,
     date_to: dateTo,
     keyword_ids,
+    search_profile: searchProfile,
     time_filter: timeFilter,
     split_days: splitDays = config.search.splitDays,
     max_pages: maxPages = config.search.maxPages,
   } = payload;
 
-  // Job-scoped logger with structured fields (works with LOG_FORMAT=json)
-  const jobLogger = createLogger('job', { job_id, job_type });
+  const profileSpec = getProfile(searchProfile);
+  const scheduleToday = new Date();
 
-  const sites = Array.from(new Set(rawSites.map((s) => normalizeSite(s)).filter(Boolean)));
+  // Job-scoped logger with structured fields (works with LOG_FORMAT=json)
+  const jobLogger = createLogger('job', { job_id, job_type, search_profile: searchProfile });
+
+  const requestedSites = Array.from(new Set(rawSites.map((s) => normalizeSite(s)).filter(Boolean)));
+  const profileSites = new Set(profileSpec.sites.map((site) => normalizeSite(site)));
+  const sites = profileSpec.useLegacyRegistry
+    ? requestedSites
+    : requestedSites.filter((site) => profileSites.has(site));
+  const unsupportedSites = profileSpec.useLegacyRegistry
+    ? []
+    : requestedSites.filter((site) => !profileSites.has(site));
+  if (unsupportedSites.length > 0) {
+    jobLogger.warning('sites_not_supported_by_profile', {
+      requestedSites: unsupportedSites,
+      profileSites: Array.from(profileSites),
+    });
+  }
   if (sites.length === 0) {
-    logger.error(`[Job ${job_id}] no valid search_sites`);
+    logger.error(`[Job ${job_id}] no valid search_sites for profile=${searchProfile}`);
     throw new JobFailedError('no valid search_sites', {
       totalUrlsScraped: 0,
       urlsScrapedBySite: {},
@@ -265,7 +343,36 @@ async function runJob(payload: DorkTriggerPayload): Promise<JobRunSummary> {
   const keywords = await loadKeywords(keyword_ids);
   const numWorkers = Math.min(config.search.workers, keywords.length);
 
-  jobLogger.info('job_params', { keywords: keywords.length, workers: numWorkers });
+  const loadedProvinces = new Set(keywords.map((keyword) => keyword.province));
+  const missingProfileProvinces = profileSpec.useLegacyRegistry
+    ? []
+    : Array.from(new Set(profileSpec.places.map((place) => place.provinceSlug)))
+        .filter((provinceSlug) => !loadedProvinces.has(provinceSlug));
+  if (missingProfileProvinces.length > 0) {
+    jobLogger.warning('profile_provinces_missing_from_dim_keyword', {
+      provinceSlugs: missingProfileProvinces,
+    });
+  }
+
+  const dueProfileChunks = profileSpec.useLegacyRegistry
+    ? []
+    : selectDuePlaces(
+        chunkPlaces(profileSpec.places, profileSpec.placesPerQuery),
+        profileSpec.cadence,
+        scheduleToday,
+      );
+  const placeCoverage = {
+    duePlaces: dueProfileChunks.reduce((sum, chunk) => sum + chunk.places.length, 0),
+    totalPlaces: profileSpec.places.length,
+  };
+
+  jobLogger.info('job_params', {
+    keywords: keywords.length,
+    workers: numWorkers,
+    search_profile: searchProfile,
+    due_places: placeCoverage.duePlaces,
+    total_places: placeCoverage.totalPlaces,
+  });
 
   // Tạo crawl_run per site
   const runType = job_type === 'manual' ? 'backfill' : job_type;
@@ -320,12 +427,13 @@ async function runJob(payload: DorkTriggerPayload): Promise<JobRunSummary> {
       batch.map(async (kw) => {
         try {
           const stats = await runOneKeyword(
-            kw, sites, dateFrom, dateTo,
+            kw, sites, searchProfile, dateFrom, dateTo,
             splitDays,
             timeFilter,
             job_type,
             maxPages,
             runIdBySite, insertedBySite,
+            scheduleToday,
           );
           return { kw, stats };
         } catch (e) {
@@ -393,6 +501,9 @@ async function runJob(payload: DorkTriggerPayload): Promise<JobRunSummary> {
     failedSites: siteFailures.size,
     blockedSites: siteBlocks.size,
     jobFailed,
+    search_profile: searchProfile,
+    due_places: placeCoverage.duePlaces,
+    total_places: placeCoverage.totalPlaces,
   });
 
   // Hoàn thành crawl_run
@@ -528,6 +639,7 @@ async function main() {
       date_from: dateFrom,
       date_to: dateTo,
       keyword_ids: config.oneShot.keywordIds,
+      search_profile: config.oneShot.searchProfile,
       split_days: config.search.splitDays,
       max_pages: config.search.maxPages,
       time_filter: config.oneShot.timeFilter,

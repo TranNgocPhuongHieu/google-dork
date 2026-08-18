@@ -27,6 +27,8 @@ Nguyên tắc mở rộng là “thêm ngôn ngữ = một file mới + một d�
 
 `vi_legacy` dùng `entity_registry.ts` và giữ nguyên query cũ để rollback tức thì. Profile place-based dùng bảng riêng, không sửa registry cũ và không sửa `google_crawler.ts`.
 
+Backfill EN one-shot chạy tay qua `src/serper_en_backfill.ts`; script không được đăng ký vào DAG, scheduler hoặc service production.
+
 ## 2. Bảng địa điểm
 
 ### VI — 278 entry
